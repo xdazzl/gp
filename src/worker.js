@@ -23,7 +23,33 @@ const MAX_RETRY = 3;
 const RETRY_BASE_MS = 900;
 const RETRY_JITTER_MS = 500;
 
-// ==== 公共工具 ====
+const DROP_RESPONSE_HEADERS = [
+  "content-security-policy",
+  "content-security-policy-report-only",
+  "report-to",
+  "nel",
+  "cross-origin-embedder-policy",
+  "cross-origin-opener-policy",
+  "cross-origin-resource-policy",
+];
+
+const URL_ATTRS = [
+  "href","src","action","poster","data-href","data-src","data-url",
+  "data-download-url","data-clipboard-text","value",
+];
+const REWRITE_SELECTOR =
+  "a,link,script,img,source,video,iframe,form,meta,include-fragment,turbo-frame,details-dialog,details-menu,clipboard-copy";
+
+const PENDING = new Map();
+
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+function getSetCookies(headers){
+  if (typeof headers.getSetCookie === "function") return headers.getSetCookie();
+  const single = headers.get("set-cookie"); if (!single) return [];
+  return single.split(/,(?=[^;]+?=)/g);
+}
+function rewriteSetCookieToCurrentHost(sc){ return sc.replace(/;\s*Domain=[^;]+/gi,""); }
+
 const ALLOWED_HOST = (h) => {
   if (!h) return false;
   h = h.toLowerCase();
@@ -36,33 +62,6 @@ const ALLOWED_HOST = (h) => {
     h === "ghcr.io"
   );
 };
-
-const DROP_RESPONSE_HEADERS = [
-  "content-security-policy",
-  "content-security-policy-report-only",
-  "report-to",
-  "nel",
-  "cross-origin-embedder-policy",
-  "cross-origin-opener-policy",
-  "cross-origin-resource-policy",
-];
-
-// 扩展属性覆盖：含 data-download-url、data-clipboard-text、value
-const URL_ATTRS = [
-  "href","src","action","poster","data-href","data-src","data-url",
-  "data-download-url","data-clipboard-text","value",
-];
-// 扩大选择器
-const REWRITE_SELECTOR =
-  "a,link,script,img,source,video,iframe,form,meta,include-fragment,turbo-frame,details-dialog,details-menu,clipboard-copy";
-
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
-function getSetCookies(headers){
-  if (typeof headers.getSetCookie === "function") return headers.getSetCookie();
-  const single = headers.get("set-cookie"); if (!single) return [];
-  return single.split(/,(?=[^;]+?=)/g);
-}
-function rewriteSetCookieToCurrentHost(sc){ return sc.replace(/;\s*Domain=[^;]+/gi,""); }
 
 function parseUpstreamFromPath(pathname){
   if (!pathname.startsWith(PROXY_PREFIX)) return null;
@@ -91,7 +90,6 @@ function shortcutGithubRaw(host, path){
   const m = path.match(/^\/([^\/]+)\/([^\/]+)\/raw\/(.+)$/);
   if (!m) return null;
   const owner = m[1], repo = m[2], rest = m[3];
-  if (!rest) return null;
   let ref = "", fpath = "";
   if (rest.startsWith("refs/heads/") || rest.startsWith("refs/tags/")){
     const parts = rest.split("/");
@@ -173,7 +171,7 @@ class HtmlLinkRewriter{
   }
 }
 
-// 客户端补丁：动态节点重写 + fetch/XHR 拦截（兜底）
+// 客户端补丁
 const CLIENT_FIXUP_JS = `
 (() => {
   const PROXY_PREFIX=${JSON.stringify(PROXY_PREFIX)};
@@ -210,7 +208,6 @@ const CLIENT_FIXUP_JS = `
   });
   mo.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:["src","href","action","data-src","data-href","data-url","data-download-url","data-clipboard-text","value"]});
 
-  // fetch 拦截
   const of=window.fetch.bind(window);
   window.fetch=(input, init)=>{
     try{
@@ -221,7 +218,6 @@ const CLIENT_FIXUP_JS = `
     }catch{}
     return of(input, init);
   };
-  // XHR 拦截
   const oo=XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open=function(m,u,...r){ try{u=toProxy(u);}catch{} return oo.call(this,m,u,...r); };
 })();`;
@@ -385,31 +381,19 @@ function primaryLang(acceptLang){
   const first = acceptLang.split(",")[0].trim();
   return first.slice(0,20);
 }
-function makeAnonReq(req){
-  const h = new Headers(req.headers);
-  h.delete("cookie"); h.delete("authorization");
-  return new Request(req.url, { method:"GET", headers:h, redirect:"manual" });
+function searchLocalKey(req){
+  const url = new URL(req.url);
+  const lang = primaryLang(req.headers.get("accept-language")||"");
+  if (lang) url.searchParams.set("__w_s_v", "hl="+encodeURIComponent(lang));
+  return new Request(url.toString(), { method:"GET" });
 }
-function withSavedAtHeader(resp){
-  const rh = new Headers(resp.headers);
-  rh.set("x-w-saved-at", Date.now().toString());
-  return new Response(resp.body, { status: resp.status, headers: rh });
-}
-function savedAgeSeconds(resp){
-  const t = Number(resp.headers.get("x-w-saved-at"));
-  if (!Number.isFinite(t)) return null;
-  return Math.max(0, Math.floor((Date.now()-t)/1000));
-}
-function isOkStatus(s){ return s>=200 && s<400; }
-
-// KV key = sha256("SEARCH|" + normalizedURL + "|lang="+lang)
 async function sha256b64url(str){
   const ab = new TextEncoder().encode(str);
   const d = await crypto.subtle.digest("SHA-256", ab);
   const b = String.fromCharCode(...new Uint8Array(d));
   return btoa(b).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
 }
-async function kvSearchKey(req){
+async function searchKvKey(req){
   const url = new URL(req.url);
   const lang = primaryLang(req.headers.get("accept-language")||"");
   const norm = url.origin + url.pathname + "?" + url.searchParams.toString();
@@ -427,39 +411,45 @@ async function kvGetSearch(env, key){
     return new Response(j.body, { status: j.status||200, headers: h });
   }catch{return null;}
 }
-async function kvPutSearch(ctx, env, key, resp){
+// 改为直接写字符串，避免再读流
+async function kvPutSearchHTML(ctx, env, key, bodyText, status, headers){
   if (!env.SEARCH_KV) return;
   try{
-    const c = await resp.clone().text();
     const savedAt = Date.now();
     const toStore = {
-      body: c,
-      status: resp.status,
+      body: bodyText,
+      status,
       headers: { "content-type": "text/html; charset=utf-8" },
       savedAt,
     };
     ctx.waitUntil(env.SEARCH_KV.put(key, JSON.stringify(toStore), { expirationTtl: SEARCH_TTL + SEARCH_STALE + 3600 }));
   }catch{}
 }
-function searchCacheKey(req){ // 本地 caches.default key（含语言维度）
-  const url = new URL(req.url);
-  const lang = primaryLang(req.headers.get("accept-language")||"");
-  if (lang) url.searchParams.set("__w_s_v", "hl="+encodeURIComponent(lang));
-  return new Request(url.toString(), { method:"GET" });
+function savedAgeSeconds(resp){
+  const t = Number(resp.headers.get("x-w-saved-at"));
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, Math.floor((Date.now()-t)/1000));
+}
+function isOkStatus(s){ return s>=200 && s<400; }
+function makeAnonReq(req){
+  const h = new Headers(req.headers);
+  h.delete("cookie"); h.delete("authorization");
+  return new Request(req.url, { method:"GET", headers:h, redirect:"manual" });
 }
 
-// ===== Durable Object 全局令牌桶（在文件末尾定义类）=====
+// DO 全局限流（失败则忽略，不影响主流程）
 async function globalSearchGate(env){
-  if (!env.SEARCH_DO) return; // 未绑定则跳过
-  const id = env.SEARCH_DO.idFromName("GLOBAL");
-  const stub = env.SEARCH_DO.get(id);
-  // /take 会在 DO 内部等待直到有 token
-  await stub.fetch("https://do/take");
+  try{
+    if (!env.SEARCH_DO) return;
+    const id = env.SEARCH_DO.idFromName("GLOBAL");
+    const stub = env.SEARCH_DO.get(id);
+    await stub.fetch("https://do/take");
+  }catch{}
 }
 
-// ===== 主逻辑 =====
 class InjectFixupScript { element(el){ el.append(`<script>${CLIENT_FIXUP_JS}</script>`, { html:true }); } }
 
+// ===== 主逻辑 =====
 export default {
   async fetch(req, env, ctx){
     try{
@@ -475,48 +465,21 @@ export default {
         return new Response(null, { status:204, headers: rh });
       }
 
-      // A) 匿名搜索：KV(全局) + 本地缓存 + 全局限流 + SWR
+      // A) 匿名搜索：KV(全局) + 本地缓存 + DO 限流 + SWR
       if (isAnonSearchRequest(req)){
         const cache = caches.default;
-        const localKey = searchCacheKey(req);
-        const kvKey = await kvSearchKey(req);
+        const localKey = searchLocalKey(req);
+        const kvKey = await searchKvKey(req);
 
-        // 1. 先查本地缓存
+        // 1. 本地缓存
         const localHit = await cache.match(localKey);
         if (localHit){
           const age = savedAgeSeconds(localHit);
           if (age!==null){
             if (age <= SEARCH_TTL) return localHit;
             if (age <= SEARCH_TTL + SEARCH_STALE){
-              // 过期可陈旧：秒回旧 + 后台刷新
-              ctx.waitUntil((async()=>{
-                try{
-                  await globalSearchGate(env);
-                  const anonReq = makeAnonReq(req);
-                  const { res } = await proxyFetch(anonReq);
-                  if (isOkStatus(res.status)){
-                    const base = makePlainResponse(res, anonReq);
-                    const rh = base.headers; const status = base.status;
-                    appendVary(rh, "Accept-Language");
-                    if (isHtmlReq(anonReq) && isHtmlLikeResponse(rh, anonReq.headers) && res.body){
-                      rh.delete("content-length"); rh.delete("content-encoding");
-                      applyCachingHeaders(rh, SEARCH_TTL, SEARCH_STALE);
-                      const transformed = new HTMLRewriter()
-                        .on(REWRITE_SELECTOR, new HtmlLinkRewriter())
-                        .on("head", new InjectFixupScript())
-                        .transform(new Response(res.body, { status, headers: rh }));
-                      const toStore = withSavedAtHeader(transformed);
-                      ctx.waitUntil(cache.put(localKey, toStore.clone()));
-                      await kvPutSearch(ctx, env, kvKey, toStore.clone());
-                    }else{
-                      applyCachingHeaders(rh, SEARCH_TTL, SEARCH_STALE);
-                      const finalRes = withSavedAtHeader(new Response(res.body, { status, headers: rh }));
-                      ctx.waitUntil(cache.put(localKey, finalRes.clone()));
-                      await kvPutSearch(ctx, env, kvKey, finalRes.clone());
-                    }
-                  }
-                }catch{}
-              })());
+              // 立即回旧 + 后台刷新（不阻塞）
+              ctx.waitUntil(refreshSearch(env, ctx, req, localKey, kvKey));
               const sh = new Headers(localHit.headers);
               applyCachingHeaders(sh, SEARCH_TTL, SEARCH_STALE);
               sh.set("x-worker-stale","1");
@@ -525,62 +488,33 @@ export default {
           }
         }
 
-        // 2. 再查 KV 全局缓存（可大幅提高命中）
-        let kvHit = await kvGetSearch(env, kvKey);
+        // 2. KV 全局缓存
+        const kvHit = await kvGetSearch(env, kvKey);
         if (kvHit){
           const age = savedAgeSeconds(kvHit);
           const sh = new Headers(kvHit.headers);
-          appendVary(sh, "Accept-Language");
           applyCachingHeaders(sh, SEARCH_TTL, SEARCH_STALE);
-          // 把 KV 命中同步进本地缓存（异步）
-          ctx.waitUntil(cache.put(localKey, new Response(kvHit.body, { status:200, headers: withSavedAtHeader(new Response(kvHit.body, {status:200, headers: sh})).headers })));
-          // 过期则后台刷新
+          // 同步进本地缓存（异步）
+          sh.set("x-w-saved-at", String(Date.now())); // 给本地副本打上时间戳
+          ctx.waitUntil(cache.put(localKey, new Response(await kvHit.clone().text(), { status:200, headers: sh })));
+          // 如果 KV 副本已过期，后台刷新
           if (age!==null && age > SEARCH_TTL && age <= SEARCH_TTL+SEARCH_STALE){
-            ctx.waitUntil((async()=>{
-              try{
-                await globalSearchGate(env);
-                const anonReq = makeAnonReq(req);
-                const { res } = await proxyFetch(anonReq);
-                if (isOkStatus(res.status)){
-                  const base = makePlainResponse(res, anonReq);
-                  const rh = base.headers; const status = base.status;
-                  appendVary(rh, "Accept-Language");
-                  if (isHtmlReq(anonReq) && isHtmlLikeResponse(rh, anonReq.headers) && res.body){
-                    rh.delete("content-length"); rh.delete("content-encoding");
-                    applyCachingHeaders(rh, SEARCH_TTL, SEARCH_STALE);
-                    const transformed = new HTMLRewriter()
-                      .on(REWRITE_SELECTOR, new HtmlLinkRewriter())
-                      .on("head", new InjectFixupScript())
-                      .transform(new Response(res.body, { status, headers: rh }));
-                    const toStore = withSavedAtHeader(transformed);
-                    ctx.waitUntil(cache.put(localKey, toStore.clone()));
-                    await kvPutSearch(ctx, env, kvKey, toStore.clone());
-                  }else{
-                    applyCachingHeaders(rh, SEARCH_TTL, SEARCH_STALE);
-                    const finalRes = withSavedAtHeader(new Response(res.body, { status, headers: rh }));
-                    ctx.waitUntil(cache.put(localKey, finalRes.clone()));
-                    await kvPutSearch(ctx, env, kvKey, finalRes.clone());
-                  }
-                }
-              }catch{}
-            })());
+            ctx.waitUntil(refreshSearch(env, ctx, req, localKey, kvKey));
           }
           return new Response(kvHit.body, { status:200, headers: sh });
         }
 
-        // 3. 本地/KV 都没有：全局限流后回源
+        // 3. 两边都没有：全局限流后回源
         await globalSearchGate(env);
         const anonReq = makeAnonReq(req);
-
-        // 并发合并（同边缘）
         const pendingKey = "SEARCH|" + new URL(anonReq.url).toString();
-        const dangling = PENDING.get(pendingKey);
-        if (dangling){ try{ const r = await dangling; return r.clone(); }catch{} }
+        const ongoing = PENDING.get(pendingKey);
+        if (ongoing){ try{ const r = await ongoing; return r.clone(); }catch{} }
 
         const task = (async()=>{
           const { res } = await proxyFetch(anonReq);
           if (!isOkStatus(res.status)){
-            // 尝试用 KV / local 旧内容回退
+            // 回退到旧的本地或 KV
             const oldLocal = localHit || await cache.match(localKey);
             const oldKv = kvHit || await kvGetSearch(env, kvKey);
             const fallback = oldLocal || oldKv;
@@ -590,32 +524,36 @@ export default {
               sh.set("x-worker-stale","1");
               return new Response(fallback.body, { status:200, headers: sh });
             }
-            // 无旧可用：错误直传但不缓存
             const baseErr = makePlainResponse(res, anonReq);
             baseErr.headers.set("cache-control","no-store");
             return new Response(res.body, { status: res.status, headers: baseErr.headers });
           }
+
+          // 2xx/3xx：重写 -> 读为字符串 -> 返回 + 本地缓存 + KV
           const base = makePlainResponse(res, anonReq);
           const rh = base.headers; const status = base.status;
           appendVary(rh, "Accept-Language");
-          if (isHtmlReq(anonReq) && isHtmlLikeResponse(rh, anonReq.headers) && res.body){
+          let bodyText;
+          if (isHtmlLikeResponse(rh, anonReq.headers) && res.body){
             rh.delete("content-length"); rh.delete("content-encoding");
             applyCachingHeaders(rh, SEARCH_TTL, SEARCH_STALE);
             const transformed = new HTMLRewriter()
               .on(REWRITE_SELECTOR, new HtmlLinkRewriter())
               .on("head", new InjectFixupScript())
               .transform(new Response(res.body, { status, headers: rh }));
-            const toStore = withSavedAtHeader(transformed);
-            ctx.waitUntil(cache.put(localKey, toStore.clone()));
-            await kvPutSearch(ctx, env, kvKey, toStore.clone());
-            return toStore.clone();
+            bodyText = await transformed.text(); // 一次性转为字符串
           }else{
             applyCachingHeaders(rh, SEARCH_TTL, SEARCH_STALE);
-            const finalRes = withSavedAtHeader(new Response(res.body, { status, headers: rh }));
-            ctx.waitUntil(cache.put(localKey, finalRes.clone()));
-            await kvPutSearch(ctx, env, kvKey, finalRes.clone());
-            return finalRes.clone();
+            bodyText = await new Response(res.body).text();
           }
+          // 构造返回和缓存（均用字符串，避免流复用）
+          const outHeaders = new Headers(rh);
+          outHeaders.set("x-w-saved-at", String(Date.now()));
+          const finalRes = new Response(bodyText, { status: 200, headers: outHeaders });
+          // 写本地缓存 + KV（后台）
+          ctx.waitUntil(cache.put(localKey, new Response(bodyText, { status: 200, headers: outHeaders })));
+          ctx.waitUntil(kvPutSearchHTML(ctx, env, kvKey, bodyText, 200, outHeaders));
+          return finalRes;
         })();
 
         PENDING.set(pendingKey, task);
@@ -637,10 +575,11 @@ export default {
         if (ex){ try{ const r = await ex; return r.clone(); }catch{} }
 
         const task = (async()=>{
-          const { res, upstream } = await proxyFetch(req);
+          const { res } = await proxyFetch(req);
           const { headers: rh, status } = makePlainResponse(res, req);
-          const ttl = ttlFor(upstream.host);
+          const ttl = ttlFor(upstreamForCache.host);
           applyCachingHeaders(rh, ttl);
+          // 保留压缩
           const finalRes = new Response(res.body, { status, headers: rh });
           ctx.waitUntil(cache.put(key, finalRes.clone()));
           return finalRes;
@@ -673,7 +612,7 @@ export default {
   },
 };
 
-// ===== Durable Object：全局搜索限流器 =====
+// ===== Durable Object：全局搜索限流器（SQLite 迁移）=====
 export class SearchShield {
   constructor(state, env){
     this.state = state;
@@ -690,7 +629,6 @@ export class SearchShield {
   async fetch(request){
     const url = new URL(request.url);
     if (url.pathname === "/take"){
-      // 简单阻塞直到拿到 1 个 token（最多等待 ~2s）
       let waited = 0;
       while (true){
         this._refill();
@@ -703,7 +641,6 @@ export class SearchShield {
         await sleep(chunk);
         waited += chunk;
         if (waited > 2000){
-          // 等太久也给通过（防止排队过久），但总体仍会限流
           this.tokens = Math.max(0, this.tokens - 0.5);
           return new Response("ok", { status: 200 });
         }
