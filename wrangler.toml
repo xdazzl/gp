@@ -1,20 +1,19 @@
-name = "gp"
+name = "gp"                 # 你日志里脚本名是 gp，就用这个
 main = "src/worker.js"
 compatibility_date = "2024-10-01"
-workers_dev = true  # 先用 *.workers.dev 测试；绑定自定义域后可改为 false
+workers_dev = true
 
-# 绑定 KV
-[[kv_namespaces]]
-binding = "SEARCH_KV"
-id = "67a61da4a8a14f30b681f1330899177e"
-
-# 绑定 Durable Object
 [durable_objects]
 bindings = [
   { name = "SEARCH_DO", class_name = "SearchShield" }
 ]
 
-# DO 迁移（首次发布必须有）
+# 注意：用 new_sqlite_classes（免费计划要求）
 [[migrations]]
-tag = "v1"
-new_classes = ["SearchShield"]
+tag = "v1-sqlite"
+new_sqlite_classes = ["SearchShield"]
+
+# KV 绑定
+[[kv_namespaces]]
+binding = "SEARCH_KV"
+id = "67a61da4a8a14f30b681f1330899177e"
