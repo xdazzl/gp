@@ -1,4 +1,4 @@
-name = "gp"                 # 你日志里脚本名是 gp，就用这个
+name = "pang"
 main = "src/worker.js"
 compatibility_date = "2024-10-01"
 workers_dev = true
@@ -16,4 +16,5 @@ new_sqlite_classes = ["SearchShield"]
 # KV 绑定
 [[kv_namespaces]]
 binding = "SEARCH_KV"
-id = "67a61da4a8a14f30b681f1330899177e"
+id = "671b7951a19848479f0b1c401972ba64"
+
